@@ -2330,6 +2330,23 @@ def _build_session_list_cache_payload(
         diag_stage("filter_archived_sessions")
     diag_stage("visible_lineage_metadata")
     _enrich_sidebar_lineage_metadata(scoped)
+    # Delegated subagent children (#5307) are view-only, owned by the delegate
+    # runner. Coerce their sidebar rows to read_only=True + is_cli_session=False
+    # so the UI never offers delete / edit / truncate / pin affordances on them
+    # (defense-in-depth is also enforced server-side on the mutation routes).
+    def _coerce_subagent_rows(_rows):
+        for _r in _rows:
+            if not isinstance(_r, dict):
+                continue
+            _src = (
+                str(_r.get("source_tag") or _r.get("raw_source")
+                    or _r.get("session_source") or _r.get("source") or "").strip().lower()
+            )
+            if _src == "subagent":
+                _r["read_only"] = True
+                _r["is_cli_session"] = False
+    _coerce_subagent_rows(scoped)
+    _coerce_subagent_rows(sidebar_reference_sessions)
     return {
         "sessions": [
             dict(s) if isinstance(s, dict) else {}
@@ -6624,6 +6641,30 @@ def _is_subagent_child_session_id(sid: str) -> bool:
     session (#5307).
     """
     return _state_db_session_source(sid) == "subagent"
+
+
+def _session_is_subagent_view_only(sid: str) -> bool:
+    """Return True when ``sid`` is a delegated subagent child by ANY signal —
+    state.db source OR a persisted WebUI sidecar tagged subagent.
+
+    Delegated children are view-only and owned by the delegate runner. Direct
+    transcript/metadata mutation routes (delete / truncate / clear / pin /
+    rename / move) must refuse them so a stray WebUI action can't delete or
+    fork the child's state.db transcript (#5307). This is the shared
+    defense-in-depth guard for routes that bypass
+    ``_get_or_materialize_session()``.
+    """
+    if _is_subagent_child_session_id(sid):
+        return True
+    try:
+        s = get_session(sid)
+    except Exception:
+        return False
+    src = (
+        str(getattr(s, "source_tag", "") or getattr(s, "raw_source", "")
+            or getattr(s, "session_source", "") or "").strip().lower()
+    )
+    return src == "subagent"
 
 
 def _is_claimable_cli_source(cli_meta: dict, state_db_source: str = "") -> tuple[bool, str]:
@@ -12906,6 +12947,11 @@ def handle_post(handler, parsed) -> bool:
         cli_meta_for_delete = _lookup_cli_session_metadata(sid)
         if cli_meta_for_delete.get("read_only"):
             return bad(handler, "Read-only imported sessions cannot be deleted from WebUI", 400)
+        # A delegated subagent child (#5307) is view-only and owned by the
+        # delegate runner. Deleting it here would call delete_cli_session() and
+        # erase the child's state.db transcript — refuse it.
+        if _session_is_subagent_view_only(sid):
+            return bad(handler, "Subagent sessions are view-only and cannot be deleted from WebUI", 400)
         is_messaging_session = _is_messaging_session_id(sid)
         worktree_retained = _worktree_retained_payload_for_session_id(sid)
         try:
@@ -12984,6 +13030,8 @@ def handle_post(handler, parsed) -> bool:
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
+        if _session_is_subagent_view_only(body["session_id"]):
+            return bad(handler, "Subagent sessions are view-only and cannot be modified from WebUI", 400)
         try:
             s = get_session(body["session_id"])
         except KeyError:
@@ -13011,6 +13059,8 @@ def handle_post(handler, parsed) -> bool:
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
+        if _session_is_subagent_view_only(body["session_id"]):
+            return bad(handler, "Subagent sessions are view-only and cannot be modified from WebUI", 400)
         if body.get("keep_count") is None:
             return bad(handler, "Missing required field(s): keep_count")
         try:
@@ -13786,6 +13836,8 @@ def handle_post(handler, parsed) -> bool:
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
+        if _session_is_subagent_view_only(body["session_id"]):
+            return bad(handler, "Subagent sessions are view-only and cannot be modified from WebUI", 400)
         try:
             s = get_session(body["session_id"])
             s = _ensure_full_session_before_mutation(body["session_id"], s)

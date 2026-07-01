@@ -337,3 +337,39 @@ def test_materialize_helper_refuses_persisted_writable_subagent_sidecar(
     )
     with pytest.raises(PermissionError):
         routes_module._get_or_materialize_session("persisted-sa")
+
+
+def test_subagent_view_only_guard_helper(routes_module, isolated_state_db):
+    """_session_is_subagent_view_only is True for a state.db subagent source
+    (used by the delete/truncate/clear/pin mutation-route guards, #5307)."""
+    _make_state_db(
+        isolated_state_db["db"], "sa-guard-1", source="subagent", message_count=1,
+    )
+    assert routes_module._session_is_subagent_view_only("sa-guard-1") is True
+    _make_state_db(
+        isolated_state_db["db"], "tui-guard-1", source="tui", message_count=1,
+    )
+    # a non-subagent id with no matching sidecar is not flagged
+    assert routes_module._session_is_subagent_view_only("nope-nope") is False
+
+
+def test_mutation_routes_guard_subagent_source_in_source():
+    """Static contract: the direct session-mutation routes (delete / clear /
+    truncate / pin) refuse subagent children via _session_is_subagent_view_only
+    before mutating, and the /api/sessions list coerces subagent rows to
+    read_only=True / is_cli_session=False (#5307 Codex round 8 — prevents
+    delete/swipe from erasing the child's state.db transcript)."""
+    src = ROUTES_PY.read_text(encoding="utf-8")
+    # each mutation route body must call the guard
+    for route in ("/api/session/delete", "/api/session/clear",
+                  "/api/session/truncate", "/api/session/pin"):
+        idx = src.index(f'parsed.path == "{route}"')
+        nxt = src.index('parsed.path == "/api/session', idx + 10)
+        block = src[idx:nxt]
+        assert "_session_is_subagent_view_only(" in block, (
+            f"{route} must guard against subagent children before mutating"
+        )
+    # list coercion present
+    assert "_coerce_subagent_rows" in src, (
+        "the /api/sessions list must coerce subagent rows to read_only/non-CLI"
+    )
